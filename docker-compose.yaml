@@ -1,5 +1,3 @@
-version: "3.8"
-
 services:
   mysql:
     image: mysql:8.0
@@ -10,6 +8,7 @@ services:
       MYSQL_DATABASE: taskdb
       MYSQL_USER: taskuser
       MYSQL_PASSWORD: taskpass
+      TZ: UTC
     ports:
       - "3306:3306"
     volumes:

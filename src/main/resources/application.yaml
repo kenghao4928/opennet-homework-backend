@@ -1,9 +1,59 @@
 spring:
   application:
-    name: demo
+    name: notification-service
+  jackson:
+    deserialization:
+      fail-on-unknown-properties: false
 
-# define mysql properties here
+  datasource:
+    url: jdbc:mysql://localhost:3306/taskdb?useSSL=false&serverTimezone=UTC&allowPublicKeyRetrieval=true&characterEncoding=UTF-8
+    username: taskuser
+    password: taskpass
+    driver-class-name: com.mysql.cj.jdbc.Driver
+    hikari:
+      maximum-pool-size: 10
+      minimum-idle: 2
 
-# define redis properties here
+  jpa:
+    hibernate:
+      ddl-auto: validate
+    open-in-view: false
+    properties:
+      hibernate:
+        dialect: org.hibernate.dialect.MySQLDialect
+        format_sql: true
+        jdbc:
+          time_zone: UTC
 
-# define rocketmq properties here
+  data:
+    redis:
+      host: localhost
+      port: 6379
+      timeout: 2000ms
+      lettuce:
+        pool:
+          max-active: 8
+          max-idle: 8
+          min-idle: 0
+
+rocketmq:
+  name-server: localhost:9876
+  producer:
+    group: producer-group
+    send-message-timeout: 3000
+    retry-times-when-send-failed: 2
+
+server:
+  port: 8080
+
+logging:
+  level:
+    com.example.demo: DEBUG
+    org.springframework.web: INFO
+    org.apache.rocketmq: WARN
+
+notification:
+  messaging:
+    notification:
+      topic: notification-topic
+      consumer-group: notification-consumer-group
