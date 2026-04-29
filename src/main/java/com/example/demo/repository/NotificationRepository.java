@@ -8,5 +8,5 @@ import java.util.List;
 
 public interface NotificationRepository extends JpaRepository<Notification, Long> {
 
-    List<Notification> findByOrderByCreatedAtDescIdDesc(Pageable pageable);
+    List<Notification> findByOrderByCreatedAtDesc(Pageable pageable);
 }

@@ -219,7 +219,7 @@ public class NotificationServiceImpl implements NotificationService {
     @Override
     @Transactional(readOnly = true)
     public List<NotificationBo> dbFindRecent(int limit) {
-        return notificationRepository.findByOrderByCreatedAtDescIdDesc(PageRequest.of(0, limit))
+        return notificationRepository.findByOrderByCreatedAtDesc(PageRequest.of(0, limit))
             .stream().map(notificationMapper::toBo).toList();
     }
 
