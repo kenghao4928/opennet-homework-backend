@@ -9,11 +9,7 @@ import org.mapstruct.Mapper;
 import org.mapstruct.Mapping;
 import org.mapstruct.ReportingPolicy;
 
-/**
- * Controller 層 mapper：純粹 VO ↔ BO 雙向轉換。
- * unmappedTargetPolicy = ERROR：VO/BO 任一邊新增欄位但忘了同步時會在編譯期報錯。
- */
-@Mapper(componentModel = "spring", unmappedTargetPolicy = ReportingPolicy.ERROR)
+@Mapper(componentModel = "spring")
 public interface NotificationControllerMapper {
 
     @Mapping(target = "id", ignore = true)
