@@ -8,7 +8,7 @@ import org.springframework.stereotype.Component;
 
 @Component
 @Slf4j
-@RocketMQMessageListener(topic = "${notification.messaging.notification.topic}", consumerGroup = "${notification.messaging.notification.consumer-group}")
+@RocketMQMessageListener(topic = "${notification.messaging.notification.topic}", consumerGroup = "${notification.messaging.notification.consumer-group}", maxReconsumeTimes = 5)
 public class NotificationConsumer implements RocketMQListener<NotificationMessage> {
 
     @Override

@@ -134,8 +134,16 @@ public class NotificationServiceImpl implements NotificationService {
     @Override
     public NotificationBo create(NotificationBo input) {
         NotificationBo bo = self.dbCreate(input);
-        cacheAddToRecent(bo);
-        notificationProducer.send(notificationMapper.toMessage(bo));
+        try {
+            cacheAddToRecent(bo);
+        } catch (RuntimeException e) {
+            log.error("cacheAddToRecent failed for new notification id={}", bo.getId(), e);
+        }
+        try {
+            notificationProducer.send(notificationMapper.toMessage(bo));
+        } catch (RuntimeException e) {
+            log.error("producer send failed id={}", bo.getId(), e);
+        }
         return bo;
     }
 
@@ -162,7 +170,11 @@ public class NotificationServiceImpl implements NotificationService {
 
     @Override
     public Optional<NotificationBo> update(Long id, UpdateNotificationBo updateBo) {
-        cacheEvictSingle(id);
+        try {
+            cacheEvictSingle(id);
+        } catch (RuntimeException e) {
+            log.error("cacheEvictSingle failed before update id={}", id, e);
+        }
         Optional<NotificationBo> bo = self.dbUpdate(id, updateBo);
         bo.ifPresent(updated -> scheduleSecondEvict(updated.getId()));
         return bo;
@@ -170,11 +182,21 @@ public class NotificationServiceImpl implements NotificationService {
 
     @Override
     public boolean delete(Long id) {
-        cacheEvictSingle(id);
+        try {
+            cacheEvictSingle(id);
+        } catch (RuntimeException e) {
+            log.error("cacheEvictSingle failed before delete id={}", id, e);
+        }
         if (!self.dbDelete(id)) {
             return false;
         }
-        long signal = cacheRemoveFromRecent(id);
+        long signal;
+        try {
+            signal = cacheRemoveFromRecent(id);
+        } catch (RuntimeException e) {
+            log.error("cacheRemoveFromRecent failed id={}", id, e);
+            signal = NotificationConstants.REFILL_NOT_NEEDED_BUFFER_OK;
+        }
         scheduleSecondEvict(id);
         if (signal >= 0L) {
             virtualThreadExecutor.execute(this::refillRecent);
@@ -187,7 +209,7 @@ public class NotificationServiceImpl implements NotificationService {
             try {
                 cacheEvictSingle(id);
             } catch (RuntimeException e) {
-                log.warn("delayed second evict failed id={}", id, e);
+                log.error("delayed second evict failed id={}", id, e);
             }
         }), NotificationConstants.DELAYED_DOUBLE_DELETE_MS, TimeUnit.MILLISECONDS);
     }
@@ -219,8 +241,8 @@ public class NotificationServiceImpl implements NotificationService {
     @Override
     @Transactional(readOnly = true)
     public List<NotificationBo> dbFindRecent(int limit) {
-        return notificationRepository.findByOrderByCreatedAtDesc(PageRequest.of(0, limit))
-            .stream().map(notificationMapper::toBo).toList();
+        return notificationRepository.findByOrderByCreatedAtDesc(PageRequest.of(0, limit)).stream()
+            .map(notificationMapper::toBo).toList();
     }
 
     @Override
@@ -271,7 +293,7 @@ public class NotificationServiceImpl implements NotificationService {
                 e);
             return loadFromDbWithSingleFlight(id);
         } catch (RuntimeException e) {
-            log.error("findById failed id={}", id, e);
+            log.error("findById failed id={}, returning empty as last-resort fallback", id, e);
             return Optional.empty();
         } finally {
             if (acquired && lock.isHeldByCurrentThread()) {
@@ -336,10 +358,10 @@ public class NotificationServiceImpl implements NotificationService {
                 missingIds, e);
             return loadFromSingleFallbackCache(missingIds);
         } catch (DataAccessException e) {
-            log.error("backfill DB failed ids={}", missingIds, e);
+            log.error("backfill DB failed ids={}, returning partial cache hits", missingIds, e);
             return Map.of();
         } catch (RuntimeException e) {
-            log.error("backfill failed ids={}", missingIds, e);
+            log.error("backfill failed ids={}, returning partial cache hits", missingIds, e);
             return Map.of();
         } finally {
             if (acquired && lock.isHeldByCurrentThread()) {
@@ -406,7 +428,8 @@ public class NotificationServiceImpl implements NotificationService {
             try {
                 resolved.putAll(self.dbFindByIds(stillMissing));
             } catch (DataAccessException e) {
-                log.error("fallback batch DB failed ids={}", stillMissing, e);
+                log.error("fallback batch DB failed ids={}, returning Caffeine-only results",
+                    stillMissing, e);
             }
         }
         Map<Long, Optional<NotificationBo>> result = new LinkedHashMap<>();
@@ -440,7 +463,7 @@ public class NotificationServiceImpl implements NotificationService {
             log.warn("getRecent fallback=redis-down, instance single-flight via Caffeine", e);
             return loadRecentFromDbWithSingleFlight();
         } catch (Exception e) {
-            log.error("getRecent failed", e);
+            log.error("getRecent failed, returning empty as last-resort fallback", e);
             return List.of();
         } finally {
             if (acquired && lock.isHeldByCurrentThread()) {
@@ -568,7 +591,15 @@ public class NotificationServiceImpl implements NotificationService {
         if (raw == null || raw.isEmpty()) {
             return List.of();
         }
-        return raw.stream().map(Long::valueOf).toList();
+        List<Long> ids = new ArrayList<>(raw.size());
+        for (String s : raw) {
+            try {
+                ids.add(Long.valueOf(s));
+            } catch (NumberFormatException e) {
+                log.warn("invalid id in recent ZSet, skipping: {}", s);
+            }
+        }
+        return ids;
     }
 
     private Map<Long, NotificationBo> cacheMultiGet(List<Long> ids) {

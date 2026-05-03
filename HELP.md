@@ -114,14 +114,15 @@ docker exec -it redis redis-cli
 | Key | 型別 | 內容 |
 |---|---|---|
 | `notification:{id}` | String (JSON) | 完整 Notification，TTL 1 小時 |
-| `notifications:recent` | Sorted Set | member = id 字串、score = createdAt epoch ms（保留最新 10 筆） |
+| `notifications:recent` | Sorted Set | member = id 字串、score = createdAt epoch ms。內部 buffer 保留最新 20 筆，`GET /notifications/recent` 對外回傳前 10 筆 |
+| `notifications:recent:exhausted` | String | DB 已耗盡旗標，TTL 60s。delete 後 buffer 不足時若旗標存在則跳過 refill |
 
 ### RocketMQ
 
 - Console UI：`http://localhost:8088`
   - Topic：`notification-topic`（訊息計數）
   - Consumer：`notification-consumer-group`（線上消費者）
-- 應用 console log：每筆 POST 對應一行 `[EMAIL] -> ...` 或 `[SMS] -> ...`
+- 應用 console log：每筆 POST 由 `NotificationProducer` 異步送訊，consumer 端在 `NotificationConsumer.onMessage` 收到後輸出 `notification received (dispatcher not yet implemented) NotificationMessage=...`（實際派發邏輯尚未實作，僅作為 MQ 鏈路驗證）
 
 ---
 
@@ -129,69 +130,54 @@ docker exec -it redis redis-cli
 
 ```bash
 ./mvnw test
-# 執行 NotificationServiceTest（12 case）+ NotificationControllerTest（10 case）
-# DemoApplicationTests 已 @Disabled（避免 CI 缺 Redis/MySQL/RocketMQ 失敗）
 ```
+
+涵蓋的 test class（皆為純 unit / Mockito，無需啟動 Redis/MySQL/RocketMQ）：
+
+| 類別 | 範圍 |
+|---|---|
+| `NotificationControllerTest` | REST 層 5 支 endpoint、validation、404 路徑 |
+| `NotificationServiceImplTest` | service 主流程：cache aside、分散式鎖、雙刪、refill 訊號 |
+| `NotificationServiceMapperTest` | MapStruct entity ↔ bo ↔ message 對映 |
+| `NotificationProducerTest` | RocketMQTemplate 異步送訊與 callback 行為 |
+| `NotificationConsumerTest` | consumer onMessage log 行為 |
+| `GlobalExceptionHandlerTest` | 各類例外 → HTTP status / body 對映 |
+| `NotificationTypeTest` | enum 反序列化大小寫包容 |
 
 ---
 
-## 快取分層架構
+## 快取架構
 
 ```
 [App Request]
     ↓
-[Caffeine L1]   process-local，TTL 30s（單筆）/ 10s（recent 列表）
-    ↓ miss     Cache.get(key, loader) 內建 single-flight
-[Redis L2]      distributed，single key TTL 1h、recent ZSet 不過期
-    ↓ miss     ZSet 含引號 JSON member、Lua 原子 SET+ZADD+TRIM
-[MySQL]         Source of Truth
+[Redis]                 single key TTL 1h（notification:{id}）
+                        recent ZSet 由 Lua 原子 SET+ZADD+ZREMRANGEBYRANK 維護，buffer 20 筆
+    ↓ miss              Redisson 分散式鎖 (lock:notification:{id} / lock:notifications:recent:rebuild)
+                        防 cache breakdown，鎖內 double-check 後查 DB 並回填
+[MySQL]                 Source of Truth
 ```
 
-### 為何分層
+### Cache breakdown 防護
 
-- **Caffeine 防 Cache Breakdown**：`Cache.get(key, loader)` 對同 key 並發只執行一次 loader。100 並發 GET 同 id 在 cache miss 時，DB 只被打 1 次（並發測試已驗證）。
-- **Redis 提供跨實例共享**：避免每個實例都從 DB 重建 cache。
-- **DB 是 SOT**：所有 cache 失效時降級為直查 DB，永遠正確。
+- **單筆 (`findById`)**：cache miss 時走 `loadWithCacheBreakdownLock`，用 Redisson `RLock` 對同 id 序列化 DB 查詢；鎖內先 double-check Redis，避免重複回填。
+- **列表 (`getRecent`)**：cache 為空時走 `rebuildWithSingleFlight`，用 `lock:notifications:recent:rebuild` 鎖一次重建 ZSet。
+- **批次回填 (`backfillWithCacheBreakdownLock`)**：ZSet 命中但部分 single key cache miss 時，用 `lock:notifications:recent:backfill` 序列化批次 DB 查詢與 pipeline 寫回。
 
-## 跨實例 Cache 主動同步
+### Caffeine fallback（degraded mode 才啟用）
 
-寫路徑 (POST/PUT/DELETE) commit 後，會發 RocketMQ 廣播訊息到 `notification-cache-sync` topic。所有 instance 的 `CacheSyncConsumer`（BROADCASTING 模式）收到訊息後：
+`CacheConfig` 提供兩個 Caffeine cache，**只在以下兩種情況才會被走到**：
 
-1. 從 DB reload 該 id 最新值（CREATED/UPDATED）；DELETED 直接淘汰
-2. 異步執行（獨立 ExecutorService，不阻塞 RocketMQ consumer thread pool）
-3. 更新自己的 Caffeine + Redis（idempotent）
-
-效果：**跨實例不一致從 30 秒（TTL 兜底）縮短到 < 1 秒（廣播延遲）**。MQ 故障時退化為 30 秒 TTL 兌現作為 ultimate safety net。
-
-訊息發送在 `TransactionSynchronization.afterCommit` 階段觸發，確保 consumer reload 時 DB 已 commit。
-
-### Consumer Group 命名
-
-`notification-cache-sync-${random.uuid}` — 每個 instance 獨立 group，避免 cluster 模式分流（BROADCASTING 模式下每 instance 都需要收到所有訊息）。
-
-## 設定備註
-
-### MySQL Server 時區
-
-`docker-compose.yaml` 為 mysql service 加了 `TZ: UTC`，確保 `CURRENT_TIMESTAMP(6)` 是 UTC。
-搭配 `application.yaml` 中的 `serverTimezone=UTC` + `hibernate.jdbc.time_zone: UTC`，全鏈路時間一律 UTC。
-API 回應的 `createdAt / updatedAt` 為 ISO-8601 帶 `Z` 後綴。
-
-### RocketMQ Broker 對外 IP
-
-`broker.conf` 中 `brokerIP1 = 127.0.0.1`：broker 將自己的位址註冊為 `127.0.0.1:10911`，讓 host 上的 Spring Boot 應用能連到 broker（否則 broker 會註冊成 docker 網路內部 IP，連不到）。
-
-### Hibernate `@Generated`
-
-`Notification` entity 的 `createdAt / updatedAt` 由 DB 端 `DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6)` 自動填入；entity 用 `@Generated(event = ...)` 在 INSERT/UPDATE 後自動 SELECT 取回 DB 產生的值。
-
----
-
-## 常見問題
-
-| 症狀 | 原因 | 解法 |
+| Cache bean | 對應情境 | TTL / Size |
 |---|---|---|
-| `connect to 192.168.x.x:10911 failed` | Broker 註冊 docker 內網 IP | 確認 `broker.conf` 含 `brokerIP1 = 127.0.0.1`，重啟 broker（`docker compose restart rocketmq-broker`） |
-| `Schema-validation: missing column` | init.sql 未執行 | 刪 mysql volume 重建：`docker compose down -v && docker compose up -d` |
-| Spring Boot 啟動失敗 connection refused | 容器尚未 ready | `docker compose ps` 等到 mysql/namesrv 顯示 `healthy` 再啟動 |
-| 8080 已被占用 | 前次未停乾淨 | `lsof -ti:8080 \| xargs kill -9` |
+| `singleFallbackCache` (AsyncCache) | Redisson `tryLock` timeout 或 Redis 拋 `RedisException` 時，對單筆 GET 與 backfill 提供 process-local single-flight + per-key 結果暫存 | TTL 5s / max 1000 |
+| `recentFallbackCache` | `getRecent` 重建鎖 timeout 或 Redis 故障時，對 recent id 列表提供 process-local single-flight | TTL 5s / max 2 |
+
+這兩個 cache 不在主路徑上；正常 Redis 可用時不會被讀寫。設計意圖是**單實例層級的 thundering herd 防護**，避免 Redis 故障窗口內所有 thread 同時打 DB。
+
+### Cache 一致性策略（寫路徑）
+
+- **POST**：DB insert → Lua 原子 `SET single + ZADD recent + ZREMRANGEBYRANK` → 異步發 RocketMQ。任何 cache 寫失敗只 log，不回滾 DB。
+- **PUT / DELETE**：採延遲雙刪 — `cacheEvictSingle` 同步刪 → DB 寫 → `delayedEvictScheduler` 延遲 1.5s 再刪一次，緩解「寫 DB 期間有 GET 把舊值寫回 Redis」的 race。
+- **DELETE 額外**：`cacheRemoveFromRecent` Lua 在 `ZREM` 後回傳訊號（buffer 仍足 / DB 已耗盡 / 需 refill），訊號 ≥ 0 時觸發異步 `refillRecent` 重建 ZSet 至 20 筆 buffer。
+- **Source of Truth**：所有 cache 異常路徑（Redis down / lock timeout / 序列化失敗）一律降級到 DB，永不回傳髒值。
